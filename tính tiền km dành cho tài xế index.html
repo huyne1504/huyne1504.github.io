@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ứng Dụng Tính Tiền Cước KM</title>
+    <!-- Tải Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Thiết lập Font Inter -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f4f7f9;
+        }
+        /* Custom styles for aesthetic buttons/inputs */
+        .input-field {
+            @apply w-full p-3 border border-gray-300 rounded-lg shadow-inner focus:ring-blue-500 focus:border-blue-500 transition duration-150;
+        }
+        .btn-primary {
+            @apply w-full py-3 px-4 text-white font-extrabold rounded-lg shadow-lg transition duration-300 ease-in-out transform;
+            @apply bg-blue-600 hover:bg-blue-700 active:bg-blue-800 focus:outline-none focus:ring-4 focus:ring-blue-300;
+            /* Bubble/Lift Effect */
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+        }
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
+        }
+        .btn-secondary {
+            @apply w-full py-2 px-4 text-sm font-medium rounded-lg shadow-sm transition duration-200 ease-in-out;
+            @apply bg-gray-200 text-gray-700 hover:bg-gray-300 active:bg-gray-400 focus:outline-none focus:ring-2 focus:ring-gray-400;
+        }
+        .btn-delete {
+            @apply p-1 text-red-500 hover:text-red-700 transition duration-150;
+        }
+        .card {
+            @apply bg-white p-6 rounded-xl shadow-2xl transition duration-300 hover:shadow-3xl border-t-4 border-blue-500;
+        }
+        .log-item:hover {
+            @apply bg-gray-50;
+        }
+    </style>
+    <!-- Firebase Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, query, addDoc, onSnapshot, orderBy, serverTimestamp, setLogLevel, doc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Vận dụng các biến toàn cục được cung cấp bởi môi trường Immersive
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db, auth, userId = null;
+        let isAuthReady = false;
+
+        // Khởi tạo Firebase và Đăng nhập
+        async function initializeFirebase() {
+            try {
+                // Bật log gỡ lỗi Firestore
+                setLogLevel('Debug');
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Lắng nghe thay đổi trạng thái xác thực
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        document.getElementById('user-info').innerText = `Người dùng ID: ${userId}`;
+                        isAuthReady = true;
+                        // Bắt đầu tải dữ liệu sau khi xác thực xong
+                        loadTripLogs();
+                    } else {
+                        // Nếu không có người dùng, ngăn chặn truy cập data và thông báo
+                        userId = null; 
+                        document.getElementById('user-info').innerText = `Vui lòng đợi xác thực hoặc đăng nhập.`;
+                        isAuthReady = false;
+                        document.getElementById('trip-logs-list').innerHTML = '<p class="text-center text-red-500 py-4">Lỗi: Không có quyền truy cập lịch sử chuyến đi. (Thiếu quyền)</p>';
+                        document.getElementById('trip-stats').innerHTML = '<p class="text-center text-red-500 py-4">Lỗi: Không có quyền truy cập thống kê.</p>';
+                    }
+                });
+
+                // Đăng nhập bằng mã thông báo tùy chỉnh hoặc ẩn danh
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+            } catch (error) {
+                console.error("Lỗi khi khởi tạo Firebase hoặc đăng nhập:", error);
+                document.getElementById('status-message').innerText = 'Lỗi khởi tạo ứng dụng. Kiểm tra console để biết chi tiết.';
+            }
+        }
+
+        // --- HELPER FUNCTIONS CHO THỜI GIAN VÀ THỐNG KÊ (GMT+7) ---
+        const VN_OFFSET_MS = 7 * 3600000; // 7 giờ * 3600000 ms/giờ
+
+        /** Trả về đối tượng Date đại diện cho thời gian hiện tại ở múi giờ Việt Nam. */
+        function getVietnamDate(date = new Date()) {
+            const localOffset = date.getTimezoneOffset() * 60000;
+            const utc = date.getTime() + localOffset;
+            return new Date(utc + VN_OFFSET_MS);
+        }
+
+        /** Trả về giờ hiện tại (0-23) theo múi giờ Việt Nam. */
+        function getVNHours(dateString) {
+            const date = new Date(dateString);
+            // Lấy giờ UTC và thêm 7 giờ offset, sau đó lấy modulo 24
+            const vnHr = (date.getUTCHours() + 7) % 24;
+            return vnHr;
+        }
+
+        /** Trả về UTC timestamp của 00:00:00 GMT+7 của ngày được truyền vào. */
+        function getVNStartOfDay(date) {
+            const d = new Date(date);
+            const utcMidnight = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+            return utcMidnight - VN_OFFSET_MS;
+        }
+
+        /** Trả về UTC timestamp của 00:00:00 GMT+7 của ngày Thứ Hai đầu tuần. */
+        function getVNStartOfWeek(date) {
+            const d = new Date(date);
+            const vnDate = getVietnamDate(d);
+            const day = vnDate.getDay(); // 0 = Chủ nhật, 1 = Thứ Hai
+            const diff = vnDate.getDate() - day + (day === 0 ? -6 : 1); // Đảm bảo Thứ Hai là ngày bắt đầu
+            const startOfWeek = new Date(vnDate.setDate(diff));
+            const utcMidnight = Date.UTC(startOfWeek.getFullYear(), startOfWeek.getMonth(), startOfWeek.getDate());
+            return utcMidnight - VN_OFFSET_MS;
+        }
+
+        /** Trả về UTC timestamp của 00:00:00 GMT+7 của ngày mùng 1 đầu tháng. */
+        function getVNStartOfMonth(date) {
+            const d = new Date(date);
+            const vnDate = getVietnamDate(d);
+            const startOfMonth = new Date(vnDate.getFullYear(), vnDate.getMonth(), 1);
+            const utcMidnight = Date.UTC(startOfMonth.getFullYear(), startOfMonth.getMonth(), startOfMonth.getDate());
+            return utcMidnight - VN_OFFSET_MS;
+        }
+
+        /** Trả về chuỗi datetime-local (YYYY-MM-DDTHH:MM) theo GMT+7. */
+        window.getVietnamLocalTime = function() {
+            const vnDate = getVietnamDate(new Date());
+            
+            const Y = vnDate.getFullYear();
+            const M = String(vnDate.getMonth() + 1).padStart(2, '0');
+            const D = String(vnDate.getDate()).padStart(2, '0');
+            const h = String(vnDate.getHours()).padStart(2, '0');
+            const m = String(vnDate.getMinutes()).padStart(2, '0');
+
+            return `${Y}-${M}-${D}T${h}:${m}`;
+        }
+        // --- END HELPER FUNCTIONS ---
+
+
+        // HÀM TÍNH TOÁN CƯỚC VỚI GIÁ ĐA CẤP (TIERED PRICING) VÀ GIÁ ĐÊM
+        window.calculateFare = function() {
+            const tripName = document.getElementById('tripName').value.trim() || 'Chuyến đi không tên';
+            const startKm = parseFloat(document.getElementById('startKm').value);
+            const endKm = parseFloat(document.getElementById('endKm').value);
+            const rateKm = parseFloat(document.getElementById('rateKm').value);
+            const waitTime = parseFloat(document.getElementById('waitTime').value) || 0;
+            const rateWait = parseFloat(document.getElementById('rateWait').value);
+            const tripDate = document.getElementById('tripDate').value;
+
+            // Kiểm tra đầu vào
+            if (isNaN(startKm) || isNaN(endKm) || isNaN(rateKm) || isNaN(rateWait)) {
+                showMessage('Vui lòng nhập đầy đủ và chính xác các giá trị (km Bắt đầu, km Kết thúc, Đơn giá Km, Đơn giá chờ).', 'error');
+                return;
+            }
+
+            if (endKm < startKm) {
+                showMessage('Số km kết thúc phải lớn hơn hoặc bằng số km bắt đầu.', 'error');
+                return;
+            }
+
+            const distanceTraveled = endKm - startKm;
+            let totalDistanceFare = 0;
+            let remainingDistance = distanceTraveled;
+
+            // Định nghĩa mức giá KM (Tự điều chỉnh theo bậc)
+            const rate1 = rateKm;           // Mức 1: 0 - 10 km (100%)
+            const rate2 = rateKm * 0.90;    // Mức 2: 10.01 - 30 km (Giảm 10%)
+            const rate3 = rateKm * 0.85;    // Mức 3: > 30 km (Giảm 15%)
+
+            let tier1Distance = 0;
+            let tier2Distance = 0;
+            let tier3Distance = 0;
+            
+            // 1. Tính Mức 3 (> 30km)
+            if (remainingDistance > 30) {
+                tier3Distance = remainingDistance - 30;
+                totalDistanceFare += tier3Distance * rate3;
+                remainingDistance = 30;
+            }
+
+            // 2. Tính Mức 2 (10.01km - 30km)
+            if (remainingDistance > 10) {
+                tier2Distance = remainingDistance - 10;
+                totalDistanceFare += tier2Distance * rate2;
+                remainingDistance = 10;
+            }
+
+            // 3. Tính Mức 1 (0 - 10km)
+            if (remainingDistance > 0) {
+                tier1Distance = remainingDistance;
+                totalDistanceFare += tier1Distance * rate1;
+            }
+
+            const baseDistanceFare = totalDistanceFare; // Lưu cước KM trước khi áp dụng giá đêm
+
+            // ----------------------------------------------------
+            // LOGIC GIÁ CƯỚC NGÀY/ĐÊM (Sử dụng getVNHours)
+            let nightSurchargeRate = 0;
+            let nightSurchargeAmount = 0;
+            
+            const selectedDate = document.getElementById('tripDate').value;
+            if (selectedDate) {
+                const tripHourVN = getVNHours(selectedDate);
+                // Giờ đêm: Từ 22h00 (10 PM) đến trước 06h00 (6 AM) VN Time
+                if (tripHourVN >= 22 || tripHourVN < 6) {
+                    nightSurchargeRate = 0.20; // Tăng 20%
+                    nightSurchargeAmount = baseDistanceFare * nightSurchargeRate;
+                    totalDistanceFare += nightSurchargeAmount;
+                }
+            }
+            // ----------------------------------------------------
+
+            const waitingFare = waitTime * rateWait;
+            let totalFare = totalDistanceFare + waitingFare; 
+
+            const breakdown = {
+                tripName: tripName,
+                distanceTraveled: distanceTraveled,
+                distanceBreakdown: {
+                    tier1: { distance: tier1Distance, rate: rate1, fare: tier1Distance * rate1 },
+                    tier2: { distance: tier2Distance, rate: rate2, fare: tier2Distance * rate2 },
+                    tier3: { distance: tier3Distance, rate: rate3, fare: tier3Distance * rate3 },
+                    baseDistanceFare: baseDistanceFare, // Cước KM gốc (chưa có giá đêm)
+                    totalDistanceFare: totalDistanceFare // Cước KM cuối cùng (Đã có giá đêm)
+                },
+                
+                nightSurchargeRate: nightSurchargeRate,
+                nightSurchargeAmount: nightSurchargeAmount,
+                waitTime: waitTime,
+                waitingFare: waitingFare,
+                totalFare: totalFare, 
+                startKm: startKm,
+                endKm: endKm,
+                rateKm: rateKm, 
+                rateWait: rateWait,
+                tripDate: tripDate,
+            };
+
+            // Hiển thị kết quả
+            displayResult(breakdown);
+
+            // Gán dữ liệu vào biến toàn cục để lưu lại
+            window.currentTripData = breakdown;
+            document.getElementById('save-trip-btn').classList.remove('hidden');
+        }
+
+        // Hàm hiển thị kết quả (Cập nhật hiển thị phí đêm rõ ràng hơn và thêm QR Code)
+        function displayResult(data) {
+            const formatter = new Intl.NumberFormat('vi-VN');
+            const resultBox = document.querySelector('#calculation-result .bg-blue-50');
+
+            let resultHTML = `
+                <p class="text-lg font-bold text-gray-900 mb-2">${data.tripName}</p>
+                <p class="text-sm font-medium text-gray-700 flex justify-between">
+                    <span>Quãng đường đi tổng cộng:</span>
+                    <span class="font-semibold text-blue-600">${formatter.format(data.distanceTraveled.toFixed(2))} km</span>
+                </p>
+                <hr class="border-blue-200 mt-2 mb-2">
+                
+                <p class="text-base font-bold text-gray-800 mb-1">CHI TIẾT CƯỚC KM (Giá cơ bản: ${formatter.format(data.rateKm)} VNĐ/km):</p>
+                `;
+                
+                // Tier 1 (0 - 10 km)
+                if (data.distanceBreakdown.tier1.distance > 0) {
+                    resultHTML += `
+                        <p class="text-sm font-medium text-gray-700 flex justify-between ml-2">
+                            <span>Mức 1 (0 - ${data.distanceBreakdown.tier1.distance.toFixed(2)} km):</span>
+                            <span class="font-semibold text-blue-600">${formatter.format(data.distanceBreakdown.tier1.fare.toFixed(0))} VNĐ</span>
+                        </p>
+                    `;
+                }
+                // Tier 2 (10.01 - 30 km)
+                if (data.distanceBreakdown.tier2.distance > 0) {
+                    const kmStart = data.distanceBreakdown.tier1.distance.toFixed(2);
+                    const kmEnd = (data.distanceBreakdown.tier1.distance + data.distanceBreakdown.tier2.distance).toFixed(2);
+                    resultHTML += `
+                        <p class="text-sm font-medium text-gray-700 flex justify-between ml-2">
+                            <span>Mức 2 (${kmStart} - ${kmEnd} km - Giảm 10%):</span>
+                            <span class="font-semibold text-blue-600">${formatter.format(data.distanceBreakdown.tier2.fare.toFixed(0))} VNĐ</span>
+                        </p>
+                    `;
+                }
+                // Tier 3 (> 30 km)
+                if (data.distanceBreakdown.tier3.distance > 0) {
+                    resultHTML += `
+                        <p class="text-sm font-medium text-gray-700 flex justify-between ml-2">
+                            <span>Mức 3 (> 30 km - Giảm 15%):</span>
+                            <span class="font-semibold text-blue-600">${formatter.format(data.distanceBreakdown.tier3.fare.toFixed(0))} VNĐ</span>
+                        </p>
+                    `;
+                }
+
+            resultHTML += `
+                <hr class="border-blue-200 mt-2 mb-2">
+                <p class="text-sm font-bold text-gray-800 flex justify-between">
+                    <span>TỔNG CƯỚC KM (Trước Phụ Phí Đêm):</span>
+                    <span class="text-base font-extrabold text-blue-700">${formatter.format(data.distanceBreakdown.baseDistanceFare.toFixed(0))} VNĐ</span>
+                </p>
+
+                <!-- DÒNG PHỤ PHÍ ĐÊM RIÊNG -->
+                <p class="text-sm font-bold flex justify-between mt-1 ${data.nightSurchargeAmount > 0 ? 'text-red-600' : 'text-gray-500'}">
+                    <span>Phụ phí ĐÊM (22:00 - 06:00, 20%):</span>
+                    <span class="text-base font-extrabold ${data.nightSurchargeAmount > 0 ? 'text-red-700' : 'text-gray-500'}">
+                        ${data.nightSurchargeAmount > 0 ? '+ ' : ''}${formatter.format(data.nightSurchargeAmount.toFixed(0))} VNĐ
+                    </span>
+                </p>
+                <!-- END DÒNG PHỤ PHÍ ĐÊM RIÊNG -->
+            
+                <p class="text-sm font-medium text-gray-700 flex justify-between mt-2">
+                    <span>Cước chờ (${data.waitTime} phút):</span>
+                    <span class="font-semibold text-blue-600">${formatter.format(data.waitingFare.toFixed(0))} VNĐ</span>
+                </p>
+
+                <hr class="border-blue-400 my-2">
+                <p id="final-fare-display" class="text-xl font-bold text-green-700 flex justify-between">
+                    <span>TỔNG TIỀN CƯỚC CUỐI CÙNG:</span>
+                    <span class="text-2xl">${formatter.format(data.totalFare.toFixed(0))} VNĐ</span>
+                </p>
+            `;
+
+            // --- NEW QR CODE SECTION ---
+            const totalFareFormatted = formatter.format(data.totalFare.toFixed(0));
+            // Tạo URL placeholder cho QR Code
+            const qrText = `Tong Tien: ${totalFareFormatted} VND`;
+            // Sử dụng màu sắc và kích thước phù hợp
+            const qrCodeUrl = `https://placehold.co/150x150/0A3B5F/FFFFFF?text=${encodeURIComponent(qrText)}`;
+
+            resultHTML += `
+                <div class="mt-4 p-4 bg-gray-50 rounded-lg border border-gray-200 text-center shadow-inner">
+                    <h4 class="text-base font-bold text-blue-800 mb-2">Quét mã QR để thanh toán điện tử</h4>
+                    <img src="${qrCodeUrl}" alt="Mã QR Thanh Toán Minh Họa" class="mx-auto border-4 border-white rounded-lg shadow-xl" style="width: 150px; height: 150px;" onerror="this.onerror=null;this.src='https://placehold.co/150x150/CCCCCC/666666?text=Loi+QR+Code';">
+                    <p class="text-sm text-gray-600 mt-2">Mã QR minh họa cho tổng tiền: <span class="font-bold text-red-600">${totalFareFormatted} VNĐ</span></p>
+                    <p class="text-xs text-gray-500 mt-1">*Mã này chỉ là hình ảnh minh họa cho chức năng thanh toán.</p>
+                </div>
+            `;
+            // --- END NEW QR CODE SECTION ---
+            
+            resultBox.innerHTML = resultHTML;
+            document.getElementById('calculation-result').classList.remove('hidden');
+            showMessage('Tính toán thành công! Giá cước đã được tự động điều chỉnh theo quãng đường và thời gian.', 'success');
+        }
+
+        // HÀM HIỂN THỊ MODAL THANH TOÁN
+        window.showPaymentModal = function() {
+            if (!window.currentTripData) {
+                showMessage('Vui lòng tính toán cước trước khi thanh toán.', 'error');
+                return;
+            }
+            const formatter = new Intl.NumberFormat('vi-VN');
+            const total = formatter.format(window.currentTripData.totalFare.toFixed(0));
+            document.getElementById('payment-fare-display').innerText = `${total} VNĐ`;
+            document.getElementById('payment-modal').classList.remove('hidden');
+        }
+
+        // HÀM XỬ LÝ THANH TOÁN VÀ LƯU VÀO FIRESTORE
+        window.handlePaymentAndSave = async function(method) {
+            document.getElementById('payment-modal').classList.add('hidden'); // Đóng modal ngay lập tức
+
+            if (!db || !userId) {
+                showMessage('Hệ thống chưa sẵn sàng. Vui lòng đợi xác thực Firebase.', 'error');
+                return;
+            }
+
+            if (!window.currentTripData) {
+                showMessage('Không có dữ liệu chuyến đi để lưu.', 'error');
+                return;
+            }
+
+            try {
+                // Đường dẫn lưu trữ private data: /artifacts/{appId}/users/{userId}/trip_logs
+                const logsCollectionRef = collection(db, 'artifacts', appId, 'users', userId, 'trip_logs');
+
+                const dataToSave = {
+                    ...window.currentTripData,
+                    paymentMethod: method, // Thêm phương thức thanh toán
+                    timestamp: serverTimestamp()
+                };
+
+                await addDoc(logsCollectionRef, dataToSave);
+                showMessage(`Đã thanh toán bằng ${method} và lưu chuyến đi thành công!`, 'success');
+                document.getElementById('save-trip-btn').classList.add('hidden');
+                window.currentTripData = null; 
+                document.getElementById('tripName').value = ''; 
+            } catch (e) {
+                console.error("Lỗi khi lưu tài liệu:", e);
+                showMessage(`Lỗi khi lưu chuyến đi: ${e.message}`, 'error');
+            }
+        }
+        
+        // HÀM XÓA CHUYẾN ĐI
+        window.deleteTripLog = async function(docId) {
+            if (!db || !userId) {
+                showMessage('Hệ thống chưa sẵn sàng. Vui lòng đợi xác thực Firebase.', 'error');
+                return;
+            }
+            // Sử dụng modal tùy chỉnh thay vì alert/confirm
+            showCustomModal(`Bạn có chắc chắn muốn xóa chuyến đi ${docId.substring(0, 8)}...?`, async () => {
+                try {
+                    const docRef = doc(db, 'artifacts', appId, 'users', userId, 'trip_logs', docId);
+                    await deleteDoc(docRef);
+                    showMessage(`Đã xóa chuyến đi ID: ${docId.substring(0, 8)}... thành công!`, 'success');
+                } catch (e) {
+                    console.error("Lỗi khi xóa tài liệu:", e);
+                    showMessage(`Lỗi khi xóa chuyến đi: ${e.message}`, 'error');
+                }
+            });
+        }
+
+        // HÀM HIỂN THỊ MODAL TÙY CHỈNH (thay thế confirm)
+        function showCustomModal(message, onConfirm) {
+            const modal = document.getElementById('custom-modal');
+            document.getElementById('modal-message').innerText = message;
+            
+            const confirmBtn = document.getElementById('modal-confirm-btn');
+            const cancelBtn = document.getElementById('modal-cancel-btn');
+
+            confirmBtn.onclick = () => {
+                onConfirm();
+                modal.classList.add('hidden');
+            };
+            cancelBtn.onclick = () => {
+                modal.classList.add('hidden');
+            };
+
+            modal.classList.remove('hidden');
+        }
+
+        // HÀM HIỂN THỊ THỐNG KÊ (Cập nhật cho BÁO CÁO NGÀY/TUẦN/THÁNG)
+        function displayStats(stats) {
+            const formatter = new Intl.NumberFormat('vi-VN');
+            const statsDiv = document.getElementById('trip-stats');
+
+            const now = new Date();
+            const vnNow = getVietnamDate(now);
+            const startOfWeek = getVNStartOfWeek(now);
+            const startOfMonth = getVNStartOfMonth(now);
+
+            const statSection = (title, period, colorClass, dateInfo) => {
+                return `
+                    <div class="bg-${colorClass}-100 p-3 rounded-lg shadow-sm mb-3 border border-${colorClass}-200">
+                        <h3 class="text-sm font-bold text-${colorClass}-800 mb-1">${title} <span class="text-xs font-normal text-${colorClass}-600">(${dateInfo})</span></h3>
+                        <div class="grid grid-cols-2 gap-2 text-xs">
+                            <p class="text-${colorClass}-900 font-medium">Số chuyến:</p>
+                            <p class="text-right font-bold text-${colorClass}-700">${period.trips}</p>
+                            
+                            <p class="text-${colorClass}-900 font-medium">Quãng đường:</p>
+                            <p class="text-right font-bold text-${colorClass}-700">${formatter.format(period.distance.toFixed(2))} km</p>
+                            
+                            <p class="text-${colorClass}-900 font-medium text-base">TỔNG THU NHẬP:</p>
+                            <p class="text-right font-bold text-green-700 text-lg">${formatter.format(period.earnings.toFixed(0))} VNĐ</p>
+                        </div>
+                    </div>
+                `;
+            };
+
+            const statsHTML = `
+                ${statSection(`BÁO CÁO NGÀY`, stats.day, 'green', vnNow.toLocaleDateString('vi-VN'))}
+                ${statSection(`BÁO CÁO TUẦN`, stats.week, 'blue', `Từ ${new Date(startOfWeek).toLocaleDateString('vi-VN')}`)}
+                ${statSection(`BÁO CÁO THÁNG`, stats.month, 'purple', `Từ ${new Date(startOfMonth).toLocaleDateString('vi-VN')}`)}
+            `;
+            
+            statsDiv.innerHTML = statsHTML;
+        }
+
+        // Hàm tải các chuyến đi đã lưu từ Firestore
+        function loadTripLogs() {
+            if (!isAuthReady || !userId) return; // Chỉ chạy sau khi auth sẵn sàng
+
+            try {
+                // Đường dẫn lưu trữ private data: /artifacts/{appId}/users/{userId}/trip_logs
+                const logsCollectionRef = collection(db, 'artifacts', appId, 'users', userId, 'trip_logs');
+                // Sắp xếp theo timestamp giảm dần
+                const q = query(logsCollectionRef, orderBy('timestamp', 'desc'));
+
+                onSnapshot(q, (snapshot) => {
+                    const logsList = document.getElementById('trip-logs-list');
+                    let logHTML = '';
+                    
+                    // Biến tính toán thống kê
+                    let dailyTrips = 0;
+                    let dailyDistance = 0;
+                    let dailyEarnings = 0;
+                    let weeklyTrips = 0;
+                    let weeklyDistance = 0;
+                    let weeklyEarnings = 0;
+                    let monthlyTrips = 0;
+                    let monthlyDistance = 0;
+                    let monthlyEarnings = 0;
+                    
+                    const formatter = new Intl.NumberFormat('vi-VN');
+
+                    // Thiết lập thời gian bắt đầu của ngày, tuần, tháng HÔM NAY theo GMT+7
+                    const now = new Date();
+                    const startOfDay = getVNStartOfDay(now);
+                    const startOfWeek = getVNStartOfWeek(now);
+                    const startOfMonth = getVNStartOfMonth(now);
+
+                    snapshot.forEach((doc) => {
+                        const log = doc.data();
+                        
+                        // Lấy UTC timestamp từ Firestore
+                        const logTime = log.timestamp ? log.timestamp.toDate().getTime() : (log.tripDate ? new Date(log.tripDate).getTime() : 0);
+                        
+                        // Chuyển đổi Firestore Date sang VN Date để hiển thị
+                        const logDateObjVN = log.timestamp ? getVietnamDate(log.timestamp.toDate()) : (log.tripDate ? getVietnamDate(new Date(log.tripDate)) : null);
+                        const dateString = logDateObjVN ? logDateObjVN.toLocaleString('vi-VN') : 'N/A';
+                        
+
+                        // Cập nhật thống kê: So sánh logTime (UTC) với các mốc UTC boundary của VN
+                        if (logTime) {
+                            // 1. NGÀY
+                            if (logTime >= startOfDay) {
+                                dailyTrips++;
+                                dailyDistance += log.distanceTraveled;
+                                dailyEarnings += log.totalFare;
+                            }
+                            
+                            // 2. TUẦN
+                            if (logTime >= startOfWeek) {
+                                weeklyTrips++;
+                                weeklyDistance += log.distanceTraveled;
+                                weeklyEarnings += log.totalFare;
+                            }
+
+                            // 3. THÁNG
+                            if (logTime >= startOfMonth) {
+                                monthlyTrips++;
+                                monthlyDistance += log.distanceTraveled;
+                                monthlyEarnings += log.totalFare;
+                            }
+                        }
+
+                        // Hiển thị thông báo về giá đa cấp và giá đêm
+                        const tieredFareDisplay = log.distanceTraveled > 10 ? 
+                            `<p class="text-xs text-blue-500 font-semibold">Đã áp dụng Giá cước Đa cấp</p>` : 
+                            `<p class="text-xs text-gray-500 font-medium">Giá cước cơ bản</p>`;
+                            
+                        const nightSurchargeDisplay = log.nightSurchargeAmount > 0 ? 
+                            `<p class="text-xs text-red-600 font-medium">Phụ phí Đêm: ${formatter.format(log.nightSurchargeAmount.toFixed(0))} VNĐ</p>` :
+                            '';
+                        
+                        const paymentMethodDisplay = log.paymentMethod ? 
+                            `<p class="text-xs font-bold ${log.paymentMethod === 'Tiền mặt' ? 'text-green-600' : 'text-indigo-600'}">Thanh toán: ${log.paymentMethod}</p>` :
+                            '';
+
+
+                        // Đảm bảo sử dụng totalDistanceFare từ breakdown nếu có
+                        const totalDistanceFare = log.distanceBreakdown?.totalDistanceFare || 0;
+                        const waitingFare = log.waitingFare || 0;
+
+                        logHTML += `
+                            <div class="bg-white p-4 rounded-lg shadow-sm border-l-4 border-blue-500 mb-2 flex justify-between items-start log-item">
+                                <div>
+                                    <div class="flex justify-between items-center mb-1">
+                                        <p class="text-base font-bold text-gray-900">${log.tripName}</p>
+                                    </div>
+                                    <p class="text-sm text-gray-500 mb-1">
+                                        <span class="font-semibold text-gray-700">${dateString}</span>
+                                        <span class="text-xs">(ID: ${doc.id.substring(0, 8)}...)</span>
+                                    </p>
+                                    <p class="text-lg font-bold text-green-700">Tổng Tiền Cuối: ${formatter.format(log.totalFare.toFixed(0))} VNĐ</p>
+                                    ${paymentMethodDisplay}
+                                    ${tieredFareDisplay}
+                                    <div class="text-xs text-gray-600 mt-1 space-y-0.5 border-t pt-1 border-dashed">
+                                        <p>Quãng đường: ${formatter.format(log.distanceTraveled.toFixed(2))} km</p>
+                                        <p>Cước KM: ${formatter.format((totalDistanceFare - log.nightSurchargeAmount).toFixed(0))} VNĐ</p>
+                                        <p>Cước chờ: ${formatter.format(waitingFare.toFixed(0))} VNĐ</p>
+                                        ${nightSurchargeDisplay}
+                                    </div>
+                                </div>
+                                <button onclick="deleteTripLog('${doc.id}')" class="btn-delete flex-shrink-0">
+                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3m-3 0h10"></path></svg>
+                                </button>
+                            </div>
+                        `;
+                    });
+
+                    // Cập nhật phần thống kê
+                    const stats = {
+                        day: { trips: dailyTrips, distance: dailyDistance, earnings: dailyEarnings },
+                        week: { trips: weeklyTrips, distance: weeklyDistance, earnings: weeklyEarnings },
+                        month: { trips: monthlyTrips, distance: monthlyDistance, earnings: monthlyEarnings },
+                    };
+                    displayStats(stats);
+                    logsList.innerHTML = logHTML || '<p class="text-center text-gray-500 py-4">Chưa có chuyến đi nào được lưu.</p>';
+                }, (error) => {
+                    console.error("Lỗi khi tải nhật ký chuyến đi:", error);
+                    showMessage('Lỗi khi tải nhật ký chuyến đi: Thiếu quyền hoặc Lỗi Kết nối.', 'error');
+                });
+            } catch (e) {
+                console.error("Lỗi thiết lập onSnapshot:", e);
+            }
+        }
+
+        // Hàm hiển thị thông báo tùy chỉnh
+        function showMessage(message, type = 'info') {
+            const statusDiv = document.getElementById('status-message');
+            statusDiv.innerText = message;
+            statusDiv.className = 'mt-4 p-3 rounded-lg text-sm text-center font-medium transition duration-300';
+
+            if (type === 'error') {
+                statusDiv.classList.add('bg-red-100', 'text-red-800');
+            } else if (type === 'success') {
+                statusDiv.classList.add('bg-green-100', 'text-green-800');
+            } else {
+                statusDiv.classList.add('bg-blue-100', 'text-blue-800');
+            }
+        }
+
+        // Khởi động Firebase khi cửa sổ tải xong
+        window.onload = initializeFirebase;
+    </script>
+</head>
+<body class="p-4 sm:p-8">
+
+    <!-- Custom Modal for Confirmation (Xóa) -->
+    <div id="custom-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-75 overflow-y-auto h-full w-full z-50 transition-opacity flex items-center justify-center">
+        <div class="bg-white rounded-lg shadow-xl p-6 m-4 max-w-sm w-full">
+            <p id="modal-message" class="text-gray-700 text-lg mb-4 font-semibold">Bạn có chắc chắn muốn xóa mục này?</p>
+            <div class="flex justify-end space-x-3">
+                <button id="modal-cancel-btn" class="btn-secondary">Hủy</button>
+                <button id="modal-confirm-btn" class="btn-primary bg-red-600 hover:bg-red-700 focus:ring-red-300">Xác nhận Xóa</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Payment Modal (Thanh toán và Lưu) -->
+    <div id="payment-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-75 overflow-y-auto h-full w-full z-50 transition-opacity flex items-center justify-center">
+        <div class="bg-white rounded-lg shadow-xl p-6 m-4 max-w-lg w-full">
+            <h3 class="text-2xl font-extrabold text-center text-gray-800 mb-4 border-b pb-2">CHỌN PHƯƠNG THỨC THANH TOÁN</h3>
+            <p class="text-center text-lg text-gray-600 mb-2">Tổng cước cần thanh toán:</p>
+            <p id="payment-fare-display" class="text-center text-5xl font-extrabold text-green-600 mb-6"></p>
+
+            <div class="grid grid-cols-2 gap-4">
+                <button onclick="handlePaymentAndSave('Tiền mặt')" class="bg-green-500 hover:bg-green-600 text-white font-bold py-4 rounded-lg shadow-md transition duration-150 flex flex-col items-center justify-center">
+                    <svg class="w-8 h-8 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8a4 4 0 00-4 4v2m8 0v-2a4 4 0 00-4-4m-1 14h6m-3-3v6m-3-6h6"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 9V7a2 2 0 00-2-2H9a2 2 0 00-2 2v2m0 8h10a2 2 0 002-2v-2a2 2 0 00-2-2H7a2 2 0 00-2 2v2a2 2 0 002 2z"></path></svg>
+                    <span>TIỀN MẶT</span>
+                </button>
+                <button onclick="handlePaymentAndSave('QR Code')" class="bg-indigo-500 hover:bg-indigo-600 text-white font-bold py-4 rounded-lg shadow-md transition duration-150 flex flex-col items-center justify-center">
+                    <svg class="w-8 h-8 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 4V2a1 1 0 011-1h2a1 1 0 011 1v2m-6 0h6m-6 0H6a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-2"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 11V8m-4 4l-2 2m4 0l2-2m-4-2h4M9 14h6m-3-5V7"></path></svg>
+                    <span>QR CODE / CHUYỂN KHOẢN</span>
+                </button>
+            </div>
+            <button onclick="document.getElementById('payment-modal').classList.add('hidden')" class="btn-secondary mt-4">Đóng</button>
+        </div>
+    </div>
+    
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-3xl font-extrabold text-gray-900 mb-2 text-center">
+            <svg class="w-8 h-8 inline-block text-blue-600 mr-2 -mt-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.727A8 8 0 016.343 3.273L12 12V2.733l-5.733 5.734a9.001 9.001 0 0011.393 8.35v0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 3v2l2.35 2.35M18 18h2v-2l-2.35-2.35"></path></svg>
+            TÍNH TIỀN KM & QUẢN LÝ CHUYẾN ĐI
+        </h1>
+        <p class="text-center text-sm text-gray-500 mb-6" id="user-info">Đang xác thực...</p>
+
+        <div id="status-message" class="hidden"></div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+
+            <!-- Cột 1: Tính Toán Tiền Cước -->
+            <div class="card">
+                <h2 class="text-xl font-semibold text-gray-800 mb-4 border-b pb-2">1. Nhập Thông Tin Chuyến Đi</h2>
+                
+                <p class="text-xs text-gray-500 mb-4 bg-yellow-50 p-2 rounded-lg border border-yellow-200">
+                    *Ghi chú: Giá cước KM tự động điều chỉnh theo **Bậc khoảng cách** và **Phụ phí đêm (22:00 - 06:00)**.
+                </p>
+
+                <div class="space-y-4">
+                    <!-- Tên Chuyến Đi / Khách Hàng -->
+                    <div>
+                        <label for="tripName" class="block text-sm font-medium text-gray-700 mb-1">Tên Khách/Tuyến đường (Tùy chọn)</label>
+                        <input type="text" id="tripName" class="input-field" placeholder="Ví dụ: Sân bay -> Quận 1">
+                    </div>
+
+                    <!-- KM Bắt đầu & Kết thúc -->
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label for="startKm" class="block text-sm font-medium text-gray-700 mb-1">Km Bắt đầu</label>
+                            <input type="number" id="startKm" value="0" step="0.01" class="input-field" placeholder="Ví dụ: 0.00">
+                        </div>
+                        <div>
+                            <label for="endKm" class="block text-sm font-medium text-gray-700 mb-1">Km Kết thúc</label>
+                            <input type="number" id="endKm" value="35.50" step="0.01" class="input-field" placeholder="Ví dụ: 35.50">
+                        </div>
+                    </div>
+
+                    <!-- Đơn giá KM & Chờ -->
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label for="rateKm" class="block text-sm font-medium text-gray-700 mb-1">Đơn giá cước CƠ BẢN (VNĐ/km)</label>
+                            <input type="number" id="rateKm" value="15000" class="input-field" placeholder="Ví dụ: 15000">
+                        </div>
+                        <div>
+                            <label for="rateWait" class="block text-sm font-medium text-gray-700 mb-1">Đơn giá chờ (VNĐ/phút)</label>
+                            <input type="number" id="rateWait" value="500" class="input-field" placeholder="Ví dụ: 500">
+                        </div>
+                    </div>
+
+                    <!-- Thời gian chờ & Ngày chuyến đi -->
+                    <div class="grid grid-cols-2 gap-4">
+                         <div>
+                            <label for="waitTime" class="block text-sm font-medium text-gray-700 mb-1">Thời gian chờ (phút)</label>
+                            <input type="number" id="waitTime" value="5" class="input-field" placeholder="Ví dụ: 5">
+                        </div>
+                        <div>
+                            <label for="tripDate" class="block text-sm font-medium text-gray-700 mb-1">
+                                Ngày/Giờ (Giá Đêm)
+                            </label>
+                            <input type="datetime-local" id="tripDate" class="input-field" value="" onfocus="this.value = getVietnamLocalTime()">
+                            <p class="text-xs text-gray-500 mt-1">Phụ phí Đêm (20%) áp dụng từ 22:00 - 06:00 VN.</p>
+                        </div>
+                    </div>
+
+                    <button onclick="calculateFare()" class="btn-primary mt-6">
+                        <svg class="w-5 h-5 inline-block mr-2 -mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 7h6m0 10v4m-3-4h3m-3 0h-3"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 9V5a2 2 0 00-2-2H5a2 2 0 00-2 2v14a2 2 0 002 2h4"></path></svg>
+                        TÍNH TIỀN CƯỚC NGAY
+                    </button>
+                </div>
+
+                <!-- Kết Quả Tính Toán -->
+                <div id="calculation-result" class="hidden mt-6 pt-4 border-t border-gray-200">
+                    <h3 class="text-xl font-bold text-gray-900 mb-4 text-center">KẾT QUẢ CƯỚC</h3>
+                    <div class="bg-blue-50 p-4 rounded-lg space-y-2">
+                        <!-- Kết quả sẽ được hiển thị ở đây bởi JavaScript -->
+                        <p class="text-center text-gray-500">Vui lòng bấm TÍNH TIỀN CƯỚC NGAY</p>
+                    </div>
+                    <!-- Nút này bây giờ gọi modal thanh toán -->
+                    <button id="save-trip-btn" onclick="showPaymentModal()" class="btn-primary bg-green-600 hover:bg-green-700 mt-4 hidden">
+                        <svg class="w-5 h-5 inline-block mr-2 -mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8a4 4 0 00-4 4v2m8 0v-2a4 4 0 00-4-4m-1 14h6m-3-3v6m-3-6h6"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 9V7a2 2 0 00-2-2H9a2 2 0 00-2 2v2m0 8h10a2 2 0 002-2v-2a2 2 0 00-2-2H7a2 2 0 00-2 2v2a2 2 0 002 2z"></path></svg>
+                        THANH TOÁN & LƯU CHUYẾN ĐI
+                    </button>
+                </div>
+            </div>
+
+            <!-- Cột 2: Lịch Sử Chuyến Đi -->
+            <div class="card">
+                <h2 class="text-xl font-semibold text-gray-800 mb-4 border-b pb-2">2. Lịch Sử & Thống Kê</h2>
+                
+                <div id="trip-stats">
+                    <!-- Thống kê NGÀY/TUẦN/THÁNG sẽ được hiển thị ở đây bởi JavaScript -->
+                    <p class="text-center text-gray-500 py-4">Đang tải thống kê...</p>
+                </div>
+
+                <h3 class="text-lg font-semibold text-gray-700 mb-2 border-b border-gray-200 pt-2">Chi tiết các chuyến đi</h3>
+
+                <div id="trip-logs-list" class="space-y-3 max-h-[450px] overflow-y-auto">
+                    <!-- Logs sẽ được tải bởi onSnapshot -->
+                    <p class="text-center text-gray-500 py-4">Đang tải lịch sử chuyến đi...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
